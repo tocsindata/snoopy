@@ -247,5 +247,3 @@ Edit with `crontab -e` (as the appropriate user):
 * All cron-able scripts use `/var/lock/snoopy.*` with TTL-based auto-unlock.
 
 ---
-
-Happy snooping! 🐾 If you want this README exported as a text/Markdown file, say the word and I’ll generate it.
