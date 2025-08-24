@@ -1,0 +1,5 @@
+# repo check, once/day (local time)
+17 4 * * * /home/USER/scripts/snoopy-repo-check.sh --notify-if-quiet 30 >> /dev/null 2>&1
+
+# backup, once/day
+12 3 * * * /home/USER/scripts/snoopy-backup.sh >> /dev/null 2>&1
