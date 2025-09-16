@@ -43,9 +43,9 @@ parse_bool() {
 
   local out=1
   case "$v" in
-    1|true|yes|y|on)    out=0 ;;
+    1|true|yes|y|on)     out=0 ;;
     0|false|no|n|off|"") out=1 ;;
-    *)                  out=1 ;;
+    *)                   out=1 ;;
   esac
 
   # restore previous nocasematch state
@@ -233,28 +233,49 @@ install_php_stack() {
 # =======================
 # Notifications / Reboot
 # =======================
+
+# helper to send a Slack message without fragile line continuations
+_slack_post_text() {
+  local text="$1"
+  curl -s -X POST -H 'Content-type: application/json' \
+       --data "{\"text\":\"${text}\"}" \
+       "$SLACK_WEBHOOK_URL" >/dev/null
+  return $?
+}
+
 handle_reboot_and_notify() {
   if [[ -f /var/run/reboot-required ]]; then
     echo "Reboot required (kernel or critical libraries updated)."
 
-    # Email (only if enabled)
+    # Email (only if enabled) — no pipe: use heredoc to mail(1)
     if parse_bool "$SEND_EMAIL"; then
-      # Ensure mailutils is present
+      # Ensure mailutils is present (best-effort)
       DEBIAN_FRONTEND=noninteractive apt -y install mailutils >/dev/null 2>&1 || true
-      echo "${EMAIL_BODY:-"System reboot required on $(hostname) at $(date)."}" \
-        | mail -s "${EMAIL_SUBJECT:-"Reboot required"}" "${EMAIL_TO:-root}" \
-        && echo "Email notification sent to ${EMAIL_TO:-root}" \
-        || echo "⚠️  Failed to send email notification."
+      local _subject _to _body
+      _subject="${EMAIL_SUBJECT:-Reboot required}"
+      _to="${EMAIL_TO:-root}"
+      _body="${EMAIL_BODY:-System reboot required on $(hostname) at $(date).}"
+
+      if mail -s "$(_getval _subject)" "$(_getval _to)" <<MAIL_BODY
+$(_getval _body)
+MAIL_BODY
+      then
+        echo "Email notification sent to $(_getval _to)"
+      else
+        echo "⚠️  Failed to send email notification."
+      fi
     fi
 
-    # Slack (only if enabled)
+    # Slack (only if enabled) — no &&/|| chain; check exit code instead
     if parse_bool "$SEND_SLACK"; then
       if [[ -n "${SLACK_WEBHOOK_URL:-}" && "$SLACK_WEBHOOK_URL" != "NULL" ]]; then
-        curl -s -X POST -H 'Content-type: application/json' \
-          --data "{\"text\":\"${SLACK_MESSAGE:-"$(hostname) will reboot to apply updates at $(date)"}\"}" \
-          "$SLACK_WEBHOOK_URL" \
-          && echo "Slack notification sent." \
-          || echo "⚠️  Failed to send Slack notification."
+        local _msg
+        _msg="${SLACK_MESSAGE:-"$(hostname) will reboot to apply updates at $(date)"}"
+        if _slack_post_text "$_msg"; then
+          echo "Slack notification sent."
+        else
+          echo "⚠️  Failed to send Slack notification."
+        fi
       else
         echo "⚠️  SLACK_WEBHOOK_URL not set; skipping Slack notification."
       fi
