@@ -1,24 +1,29 @@
 #!/bin/bash
-# file install.sh
-# Initial setup for LAMP + repo deploy (variables-only config.sh)
+# project: Snoopy/Peanut
+# file: install.sh
+# date: 2025-09-16
+# description: One-shot, idempotent LAMP bootstrap + repo deploy driven by config.sh
+# note: Requires functions.sh + config.sh in the same directory.
 
-set -e
+set -euo pipefail
 
 # Figure out script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Source helpers
 if [[ ! -f "$SCRIPT_DIR/functions.sh" ]]; then
-  echo "ERROR: functions.sh not found in $SCRIPT_DIR"
+  echo "ERROR: functions.sh not found in $SCRIPT_DIR" >&2
   exit 1
 fi
+# shellcheck source=/dev/null
 source "$SCRIPT_DIR/functions.sh"
 
 # Source config (variables only)
 if [[ ! -f "$SCRIPT_DIR/config.sh" ]]; then
-  echo "ERROR: config.sh not found in $SCRIPT_DIR"
+  echo "ERROR: config.sh not found in $SCRIPT_DIR" >&2
   exit 1
 fi
+# shellcheck source=/dev/null
 source "$SCRIPT_DIR/config.sh"
 
 check_root   # die if not root
@@ -35,8 +40,8 @@ echo "=== First Install Started: $(date) ==="
 echo "Host: $(hostname) | User: $(whoami)"
 
 # ---- Derive SNOOPY_WEB_ROOT_DIR here (config has no logic) ----
-if __is_null_or_empty "$SNOOPY_WEB_ROOT_DIR"; then
-  case "$SNOOPY_WEB_ROOT_MODE" in
+if __is_null_or_empty "${SNOOPY_WEB_ROOT_DIR:-}"; then
+  case "${SNOOPY_WEB_ROOT_MODE:-}" in
     home)         SNOOPY_WEB_ROOT_DIR="$SNOOPY_HOME" ;;
     public_html)  SNOOPY_WEB_ROOT_DIR="$SNOOPY_HOME/public_html" ;;
     public)       SNOOPY_WEB_ROOT_DIR="$SNOOPY_HOME/public" ;;
@@ -65,7 +70,6 @@ verify APACHE_CONF_DIR
 verify ADMINER_PASS_FILE_NAME
 
 verify LOG_DIR
-# (do not verify LOG_FILE; it's generated above)
 verify LOG_LEVEL
 verify LOG_RETENTION_DAYS
 
@@ -86,6 +90,10 @@ verify_optional SEND_EMAIL
 verify_optional SEND_SLACK
 verify_optional ADMINER_INSTALL
 verify_optional GITHUB_REPO_PUBLIC
+verify_optional INSTALL_PHP
+verify_optional PHP_VERSION
+verify_optional PHP_EXTRA_MODULES
+verify_optional INSTALL_MYSQL_CLIENT
 
 # =======================
 # CONDITIONAL REQUIREMENTS
@@ -109,34 +117,94 @@ require_when ADMINER_INSTALL ADMINER_HTPASSWD_PASSWORD
 require_when ADMINER_INSTALL ADMINER_HTPASSWD_USER
 
 # GitHub token requirement: private repo => token required
-if parse_bool "$GITHUB_REPO_PUBLIC"; then
+if parse_bool "${GITHUB_REPO_PUBLIC:-false}"; then
   verify_optional GITHUB_ACCESS_TOKEN
 else
   verify GITHUB_ACCESS_TOKEN
 fi
 
 # PHP requirement (only if enabled)
-require_when INSTALL_PHP PHP_VERSION "Specify which PHP to install (e.g., 8.2)"
+if parse_bool "${INSTALL_PHP:-true}"; then
+  verify PHP_VERSION "Specify which PHP to install (e.g., 8.2)"
+fi
 
-# --- Basics & upgrades ---
+# --- Basics & upgrades (curl, git, rsync, unzip, etc.) ---
+echo "Ensuring base tools are present..."
 maybe_install_basics
+
+echo "Refreshing apt metadata & upgrading packages (idempotent)..."
 apt_update_upgrade
 
-# --- Apache & PHP ---
-install_apache
-if parse_bool "$INSTALL_PHP"; then
-  install_php_stack
+# --- Ensure UNIX home + skeleton (idempotent) ---
+echo "Ensuring home directory exists: $SNOOPY_HOME"
+if [[ ! -d "$SNOOPY_HOME" ]]; then
+  mkdir -p "$SNOOPY_HOME"
+fi
+chown -R "$SNOOPY_USER:$SNOOPY_GROUP" "$SNOOPY_HOME"
+
+# --- Apache (install if missing) ---
+if ! command -v apache2ctl >/dev/null 2>&1 && ! systemctl is-enabled apache2 >/dev/null 2>&1; then
+  echo "Apache not found; installing..."
+  install_apache
+else
+  echo "Apache already present; enabling rewrite and ensuring service is active..."
+  a2enmod rewrite >/dev/null 2>&1 || true
+  systemctl enable --now apache2
+fi
+
+# --- PHP (install if missing) ---
+if parse_bool "${INSTALL_PHP:-true}"; then
+  if ! command -v "php$PHP_VERSION" >/dev/null 2>&1; then
+    echo "PHP $PHP_VERSION not found; installing..."
+    install_php_stack
+  else
+    echo "PHP $(php -r 'echo PHP_VERSION;') already present; ensuring common modules..."
+    # Try to ensure common modules exist (best-effort)
+    DEBIAN_FRONTEND=noninteractive apt -y install "php${PHP_VERSION}-mbstring" "php${PHP_VERSION}-xml" \
+      "php${PHP_VERSION}-zip" "php${PHP_VERSION}-curl" "php${PHP_VERSION}-gd" "php${PHP_VERSION}-mysql" || true
+    systemctl reload apache2 || true
+  fi
 else
   echo "INSTALL_PHP is disabled; skipping PHP."
 fi
 
-# --- Web root + vhost ---
+# --- MySQL client (for remote RDS; install if missing and enabled) ---
+if parse_bool "${INSTALL_MYSQL_CLIENT:-true}"; then
+  if ! command -v mysql >/dev/null 2>&1; then
+    echo "MySQL client not found; installing mariadb-client..."
+    DEBIAN_FRONTEND=noninteractive apt -y install mariadb-client || \
+    DEBIAN_FRONTEND=noninteractive apt -y install default-mysql-client || true
+  else
+    echo "MySQL client already present."
+  fi
+fi
+
+# --- Mail (install if missing) ---
+if parse_bool "${SEND_EMAIL:-false}"; then
+  if ! command -v mail >/dev/null 2>&1; then
+    echo "mail(1) not found; installing mailutils..."
+    DEBIAN_FRONTEND=noninteractive apt -y install mailutils || true
+  else
+    echo "mail(1) already present."
+  fi
+fi
+
+# --- Web root + vhost (create if missing) ---
 describe_web_root
 ensure_web_root
-create_apache_vhost
+
+VHOST_FILE="$APACHE_CONF_DIR/${SNOOPY_DOMAIN}.conf"
+if [[ -f "$VHOST_FILE" ]]; then
+  echo "Apache vhost already exists: $VHOST_FILE"
+  systemctl reload apache2 || true
+else
+  echo "Creating Apache vhost for ${SNOOPY_DOMAIN}..."
+  create_apache_vhost
+fi
 
 # --- Repo: clone/update then deploy to web root ---
 clone_or_update_repo
+echo "Deploying repo files to web root..."
 rsync -a --delete --exclude='.git' "$GITHUB_CLONE_DIR"/ "$SNOOPY_WEB_ROOT_DIR"/
 chown -R "$SNOOPY_USER:$SNOOPY_GROUP" "$SNOOPY_WEB_ROOT_DIR"
 
