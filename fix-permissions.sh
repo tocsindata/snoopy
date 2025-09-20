@@ -1,338 +1,271 @@
-#!/usr/bin/env bash 
-# fix-permissions.sh — diagnose 403/permissions/vhost issues for a domain
-# Safe/read-only: prints RECOMMENDED COMMANDs, does not change system state.
+#!/usr/bin/env php
+<?php
+/**
+ * fix-permissions.php — make every /home/USER/public_html site behave like cPanel/Softaculous.
+ * - One UNIX user per site (directory name under /home)
+ * - PHP-FPM pool runs AS that user, with its own unix socket
+ * - Apache proxies PHP for that docroot to that socket
+ * - Filesystem: dirs 755, files 644, owner USER:USER
+ * - Idempotent: prints OK when no changes are needed
+ *
+ * Run as root:  php fix-permissions.php  (or chmod +x and run directly)
+ */
 
-set -euo pipefail
+error_reporting(E_ALL);
+ini_set('display_errors', 'stderr');
 
-# ---------- UI ----------
-if [[ -t 1 ]]; then G="\033[32m"; Y="\033[33m"; R="\033[31m"; B="\033[34m"; X="\033[0m"; else G="";Y="";R="";B="";X=""; fi
-ok()   { echo -e "${G}✔ PASS${X}  $*"; }
-warn() { echo -e "${Y}▲ WARN${X}  $*"; }
-bad()  { echo -e "${R}✖ FAIL${X}  $*"; }
-info() { echo -e "${B}i${X}      $*"; }
-recommend() { echo "# RECOMMENDED COMMAND: $*"; }
-
-FAILS=0; WARNS=0
-note_fail(){ ((FAILS++))||true; }
-note_warn(){ ((WARNS++))||true; }
-
-have(){ command -v "$1" >/dev/null 2>&1; }
-
-# ---------- Input ----------
-DOMAIN="${1:-}"
-if [[ -z "$DOMAIN" ]]; then
-  read -rp "Domain/FQDN to check (e.g., snoopy.example.com): " DOMAIN
-fi
-DOMAIN="${DOMAIN,,}"
-
-if [[ ! "$DOMAIN" =~ ^[a-z0-9]([a-z0-9-]*\.)+[a-z]{2,}$ ]]; then
-  echo "Invalid domain: '$DOMAIN'"; exit 1
-fi
-
-# Same sanitizer used in your other scripts (dots -> underscores)
-sanitize_username() {
-  local s="${1,,}"
-  s="${s//[^a-z0-9._-]/_}"
-  s="${s//./_}"
-  s="$(echo -n "$s" | tr -s '_')"
-  echo "${s:0:32}"
+function sh($cmd, &$out=null, &$code=null) {
+    $out = [];
+    exec($cmd . ' 2>&1', $out, $code);
+    return $code === 0;
+}
+function file_put_contents_if_changed($path, $content, $mode = 0644, $ownerUser=null, $ownerGroup=null) {
+    $changed = !is_file($path) || file_get_contents($path) !== $content;
+    if ($changed) {
+        if (!is_dir(dirname($path))) {
+            mkdir(dirname($path), 0755, true);
+        }
+        file_put_contents($path, $content);
+        chmod($path, $mode);
+        if ($ownerUser !== null && $ownerGroup !== null) {
+            @chown($path, $ownerUser);
+            @chgrp($path, $ownerGroup);
+        }
+        echo "[FIXED] wrote ". $path . PHP_EOL;
+    } else {
+        echo "[OK]    ". $path . PHP_EOL;
+    }
+    return $changed;
+}
+function is_debian_like() {
+    return is_file('/etc/debian_version') || is_dir('/etc/apt');
+}
+function is_rhel_like() {
+    return is_file('/etc/redhat-release') || is_dir('/etc/yum.repos.d') || is_dir('/etc/dnf');
+}
+function detect_web_group() {
+    // Only used for socket file readability; Apache still runs as www-data/apache.
+    if (is_debian_like()) return 'www-data';
+    if (is_rhel_like())   return 'apache';
+    // fallback
+    return 'www-data';
+}
+function detect_php_fpm_version() {
+    // Prefer highest installed FPM on Debian-style /etc/php/*/fpm
+    $candidates = [];
+    foreach (glob('/etc/php/*/fpm', GLOB_ONLYDIR) ?: [] as $dir) {
+        $v = basename(dirname($dir)); // e.g., 8.3
+        if (preg_match('/^\d+\.\d+$/', $v)) $candidates[] = $v;
+    }
+    if ($candidates) {
+        usort($candidates, 'version_compare');
+        return end($candidates); // highest
+    }
+    // RHEL-ish: try to read `php-fpm -v`
+    $out = [];
+    if (sh('php-fpm -v', $out)) {
+        if (preg_match('/PHP\s+(\d+\.\d+)\./', implode("\n", $out), $m)) return $m[1];
+    }
+    // fallback to 8.3
+    return '8.3';
+}
+function service_reload($name) {
+    // Try systemctl, then service
+    $out=[]; $code=0;
+    if (sh("systemctl reload $name", $out, $code)) return true;
+    if (sh("systemctl restart $name", $out, $code)) return true;
+    if (sh("service $name reload", $out, $code))   return true;
+    if (sh("service $name restart", $out, $code))  return true;
+    echo "[WARN] Failed to reload/restart $name: ".implode(' | ',$out).PHP_EOL;
+    return false;
+}
+function ensure_mode($path, $mode) {
+    if (!file_exists($path)) return false;
+    $cur = fileperms($path) & 0777;
+    if ($cur !== $mode) {
+        chmod($path, $mode);
+        echo "[FIXED] chmod ".decoct($mode)." $path".PHP_EOL;
+        return true;
+    }
+    echo "[OK]    mode ".decoct($mode)." $path".PHP_EOL;
+    return false;
+}
+function ensure_owner($path, $user, $group, $recursive=false) {
+    if (!file_exists($path)) return false;
+    $changed = false;
+    if ($recursive) {
+        // chown/chgrp recursively via shell for speed
+        sh("chown -R ".escapeshellarg("$user:$group")." ".escapeshellarg($path));
+        echo "[FIXED] chown -R $user:$group $path".PHP_EOL;
+        return true;
+    } else {
+        $stat = @stat($path);
+        $u = $stat ? posix_getpwuid($stat['uid'])['name'] ?? null : null;
+        $g = $stat ? posix_getgrgid($stat['gid'])['name'] ?? null : null;
+        if ($u !== $user || $g !== $group) {
+            @chown($path, $user);
+            @chgrp($path, $group);
+            echo "[FIXED] chown $user:$group $path".PHP_EOL;
+            $changed = true;
+        } else {
+            echo "[OK]    owner $user:$group $path".PHP_EOL;
+        }
+        return $changed;
+    }
 }
 
-USER_NAME="$(sanitize_username "$DOMAIN")"
-DOCROOT="/home/${USER_NAME}/public_html"
+if (posix_geteuid() !== 0) {
+    fwrite(STDERR, "Run as root.\n");
+    exit(1);
+}
 
-echo
-info "Checking domain: ${DOMAIN}"
-info "Expected user : ${USER_NAME}"
-info "Expected root : ${DOCROOT}"
+$webGroup = detect_web_group();
+$phpMinor = detect_php_fpm_version();
+$phpFpmService = is_debian_like() ? "php{$phpMinor}-fpm" : "php-fpm";
+$apacheService = is_debian_like() ? "apache2" : "httpd";
+$apacheConfDir  = is_debian_like() ? "/etc/apache2" : "/etc/httpd";
+$perSiteConfDir = is_debian_like() ? "$apacheConfDir/conf-available" : "$apacheConfDir/conf.d";
+$perSiteConfEnableCmd = function($confFileBasename) use ($apacheConfDir) {
+    // Debian a2enconf, RHEL auto-loads conf.d
+    if (is_debian_like()) {
+        sh("a2enconf ".escapeshellarg($confFileBasename));
+    }
+    return true;
+};
 
-# ---------- 1) Which vhost serves this domain? ----------
-echo -e "\n------ VirtualHost Routing ------"
-APACHECTL=""
-if have apache2ctl; then APACHECTL="apache2ctl"; fi
-if [[ -z "$APACHECTL" ]] && have httpd; then APACHECTL="httpd"; fi
+// Enable Apache modules when on Debian/Ubuntu
+if (is_debian_like()) {
+    sh('a2enmod proxy proxy_fcgi setenvif', $o, $c);
+}
 
-VHOST_CONF=""
-SITES_AVAILABLE_DIR="/etc/apache2/sites-available"
-SITES_ENABLED_DIR="/etc/apache2/sites-enabled"
+// Walk /home/* and process any dir that contains public_html
+$homes = glob('/home/*', GLOB_ONLYDIR) ?: [];
+$changedPools = false;
+$changedApache = false;
 
-if [[ -n "$APACHECTL" ]]; then
-  if $APACHECTL -S >/tmp/vh.txt 2>/dev/null; then
-    # try to pull the conf path for our domain
-    HIT_LINE="$(grep -iE "namevhost[[:space:]]+$DOMAIN[[:space:]]|\s$DOMAIN[[:space:]]\(" /tmp/vh.txt || true)"
-    if [[ -n "$HIT_LINE" ]]; then
-      # Extract path inside parentheses (...) if present
-      VHOST_CONF="$(echo "$HIT_LINE" | sed -n 's/.*(\(.*\):[0-9][0-9]*).*/\1/p' | head -n1)"
-      ok "Apache is routing ${DOMAIN} using: ${VHOST_CONF:-<unknown file>}"
-    else
-      warn "apache -S did not show a vhost explicitly matching ${DOMAIN}. Requests may be hitting the default site."
-      note_warn
-      recommend "$APACHECTL -S"
-    fi
-    rm -f /tmp/vh.txt
-  else
-    warn "Could not run '$APACHECTL -S' (permission?)."
-    note_warn
-  fi
-else
-  warn "Apache control tool not found (apache2ctl/httpd). Skipping vhost routing check."
-  note_warn
-fi
+foreach ($homes as $home) {
+    $user = basename($home);
+    $docroot = "$home/public_html";
+    if (!is_dir($docroot)) {
+        echo "[SKIP] $user (no public_html)\n";
+        continue;
+    }
 
-# If we didn’t get a conf path, try typical locations:
-if [[ -z "$VHOST_CONF" ]]; then
-  if [[ -f "$SITES_AVAILABLE_DIR/$DOMAIN.conf" ]]; then
-    VHOST_CONF="$SITES_AVAILABLE_DIR/$DOMAIN.conf"
-  else
-    # Grep for ServerName match
-    CANDIDATE="$(grep -Rils "ServerName[[:space:]]\+$DOMAIN" /etc/apache2 /etc/httpd 2>/dev/null | head -n1 || true)"
-    [[ -n "$CANDIDATE" ]] && VHOST_CONF="$CANDIDATE"
-  fi
-fi
+    echo "=== Processing $user ($docroot) ===\n";
 
-# Is the site enabled?
-ENABLED_LINK="$SITES_ENABLED_DIR/$DOMAIN.conf"
-if [[ -L "$ENABLED_LINK" || -f "$ENABLED_LINK" ]]; then
-  ok "Site appears enabled: $ENABLED_LINK"
-else
-  warn "Site not enabled in sites-enabled."
-  note_warn
-  recommend "a2ensite '${DOMAIN}.conf' && apache2ctl configtest && systemctl reload apache2"
-fi
+    // 1) Baseline ownership and perms (cpanel style)
+    ensure_owner($home, $user, $user, true); // recursive
+    // parent traversal
+    ensure_mode('/home', 0755);
+    ensure_mode($home, 0755);
+    if (!is_dir($docroot)) { mkdir($docroot, 0755, true); echo "[FIXED] mkdir $docroot\n"; }
+    ensure_mode($docroot, 0755);
 
-# ---------- 2) DocumentRoot sanity ----------
-echo -e "\n------ DocumentRoot ------"
-FOUND_DOCROOT=""
-if [[ -n "$VHOST_CONF" && -f "$VHOST_CONF" ]]; then
-  FOUND_DOCROOT="$(awk '
-    /^[[:space:]]*#/ {next}
-    /<VirtualHost/ {invh=1}
-    invh && /DocumentRoot[[:space:]]+/ {print $2}
-  ' "$VHOST_CONF" 2>/dev/null | head -n1 || true)"
-fi
+    // Directories 755, Files 644 (under docroot)
+    sh("find ".escapeshellarg($docroot)." -type d -exec chmod 755 {} \\;");
+    sh("find ".escapeshellarg($docroot)." -type f -exec chmod 644 {} \\;");
+    echo "[OK]    normalized perms under $docroot (dirs 755, files 644)\n";
 
-if [[ -n "$FOUND_DOCROOT" ]]; then
-  info "Vhost DocumentRoot: $FOUND_DOCROOT"
-  if [[ "$FOUND_DOCROOT" == "$DOCROOT" ]]; then
-    ok "DocumentRoot matches expected ${DOCROOT}"
-  else
-    warn "DocumentRoot mismatch. Expected ${DOCROOT} but vhost shows ${FOUND_DOCROOT}"
-    note_warn
-    recommend "sed -i 's#^\\s*DocumentRoot\\s\\+.*#    DocumentRoot ${DOCROOT}#' '$VHOST_CONF' && apache2ctl configtest && systemctl reload apache2"
-  fi
-else
-  warn "Could not parse a DocumentRoot from the vhost file."
-  note_warn
-  recommend "grep -n 'DocumentRoot' '$VHOST_CONF'"
-fi
+    // 2) Per-site temp/log dirs
+    $tmp = "$home/tmp";
+    $sess = "$home/tmp/sessions";
+    $logs = "$home/logs";
+    foreach ([$tmp, $sess, $logs] as $d) {
+        if (!is_dir($d)) { mkdir($d, 0700, true); echo "[FIXED] mkdir $d\n"; }
+        ensure_owner($d, $user, $user);
+        ensure_mode($d, 0700);
+    }
 
-# ---------- 3) <Directory> override present? ----------
-echo -e "\n------ <Directory> Block ------"
-DIR_BLOCK_OK=0
-if [[ -n "$VHOST_CONF" && -f "$VHOST_CONF" ]]; then
-  if awk '
-      BEGIN{ok=0}
-      /^[[:space:]]*#/ {next}
-      tolower($0) ~ /<directory[[:space:]]+\/home\// {ind=1}
-      ind && tolower($0) ~ /require[[:space:]]+all[[:space:]]+granted/ {ok=1}
-      ind && /<\/Directory>/ {ind=0}
-      END{exit(ok?0:1)}
-    ' "$VHOST_CONF"; then
-    ok "Found a <Directory ...> block with 'Require all granted'."
-    DIR_BLOCK_OK=1
-  else
-    warn "Could not find a <Directory> block granting access to the docroot."
-    note_warn
-    cat <<'SNIP'
-# RECOMMENDED SNIPPET (add inside the <VirtualHost> for this site):
-#   <Directory /home/USER/public_html>
-#       Options Indexes FollowSymLinks
-#       AllowOverride All
-#       Require all granted
-#   </Directory>
-SNIP
-    [[ -n "$VHOST_CONF" ]] && recommend "nano '$VHOST_CONF'  # add the block above, then: apache2ctl configtest && systemctl reload apache2"
-  fi
-else
-  warn "No vhost file available to inspect for <Directory>."
-  note_warn
-fi
+    // 3) Ensure UserSpice common dirs exist (no file creation)
+    $usersc = "$docroot/usersc";
+    $includes = "$usersc/includes";
+    $plugins  = "$usersc/plugins";
+    $widgets  = "$usersc/widgets";
+    foreach ([$usersc, $includes, $plugins, $widgets] as $d) {
+        if (!is_dir($d)) { mkdir($d, 0755, true); echo "[FIXED] mkdir $d\n"; }
+        ensure_owner($d, $user, $user);
+        ensure_mode($d, 0755);
+    }
 
-# ---------- 4) Directory traversal permissions ----------
-echo -e "\n------ Directory Traversal & Modes ------"
-CHECK_PATHS=( "/home" "/home/${USER_NAME}" "$DOCROOT" )
-for p in "${CHECK_PATHS[@]}"; do
-  if [[ -d "$p" ]]; then
-    owner="$(stat -c '%U:%G' "$p" 2>/dev/null || echo '?')"
-    mode="$(stat -c '%a' "$p" 2>/dev/null || echo '000')"
-    # check "others execute" bit on directories (or group execute for www-data)
-    others="${mode: -1}"
-    group="${mode: -2:1}"
-    groupname="$(stat -c '%G' "$p" 2>/dev/null || echo '?')"
-    msg="$p [dir] mode=$mode owner=$owner"
-    # we consider OK if others>=5 OR (group==www-data AND group>=5)
-    if [[ "$others" -ge 5 || ( "$groupname" == "www-data" && "$group" -ge 5 ) ]]; then
-      ok "$msg (traversable)"
-    else
-      warn "$msg (NOT traversable to Apache)"
-      note_warn
-      recommend "chmod 755 '$p'   # ensure execute (x) on each parent directory"
-    fi
-  else
-    bad "$p is missing."
-    note_fail
-    recommend "mkdir -p '$p' && chown -R ${USER_NAME}:${USER_NAME} '/home/${USER_NAME}' && chmod 755 '$p'"
-  fi
-done
+    // 4) Per-site PHP-FPM pool (runs AS the site user)
+    if (is_debian_like()) {
+        $poolDir = "/etc/php/{$phpMinor}/fpm/pool.d";
+        $poolFile = "$poolDir/{$user}.conf";
+    } else {
+        // RHEL-like: still use pool.d, versionless
+        $poolDir = "/etc/php-fpm.d";
+        $poolFile = "$poolDir/{$user}.conf";
+    }
+    if (!is_dir($poolDir)) { mkdir($poolDir, 0755, true); echo "[FIXED] mkdir $poolDir\n"; }
 
-# Check typical file/dir modes inside docroot
-if [[ -d "$DOCROOT" ]]; then
-  # presence of an index file?
-  if compgen -G "$DOCROOT/index.*" >/dev/null; then
-    ok "Found index.* in docroot."
-  else
-    warn "No index.* file found. If directory listings are disabled, this can yield 403."
-    note_warn
-    recommend "echo '<h1>${DOMAIN}</h1>' | tee '$DOCROOT/index.html' >/dev/null"
-  fi
+    $sock = "/run/php-fpm-{$user}.sock";
+    $pool = <<<CONF
+[{$user}]
+user = {$user}
+group = {$user}
+listen = {$sock}
+listen.owner = {$webGroup}
+listen.group = {$webGroup}
+pm = ondemand
+pm.max_children = 10
+pm.process_idle_timeout = 10s
+chdir = {$docroot}
+php_admin_value[open_basedir] = {$docroot}:/tmp
+php_admin_value[upload_tmp_dir] = {$home}/tmp
+php_admin_value[session.save_path] = {$home}/tmp/sessions
+php_admin_value[error_log] = {$home}/logs/php-error.log
 
-  # Suggest modes if clearly too restrictive
-  TOO_RESTRICTIVE_DIRS="$(find "$DOCROOT" -type d -printf '%m %p\n' 2>/dev/null | awk '$1+0<755{print $2}' | head -n1 || true)"
-  if [[ -n "$TOO_RESTRICTIVE_DIRS" ]]; then
-    warn "Some directories under docroot have restrictive modes (<755)."
-    note_warn
-    recommend "find '$DOCROOT' -type d -exec chmod 755 {} \\;"
-  else
-    ok "Directory modes look reasonable (>=755)."
-  fi
-  TOO_RESTRICTIVE_FILES="$(find "$DOCROOT" -type f -printf '%m %p\n' 2>/dev/null | awk '$1+0<644{print $2}' | head -n1 || true)"
-  if [[ -n "$TOO_RESTRICTIVE_FILES" ]]; then
-    warn "Some files under docroot have restrictive modes (<644)."
-    note_warn
-    recommend "find '$DOCROOT' -type f -exec chmod 644 {} \\;"
-  else
-    ok "File modes look reasonable (>=644)."
-  fi
-else
-  warn "Docroot not present, skipping deeper checks."
-  note_warn
-fi
+CONF;
 
-# ---------- 5) Ownership ----------
-echo -e "\n------ Ownership ------"
-if [[ -d "/home/${USER_NAME}" ]]; then
-  owner_root="$(stat -c '%U:%G' "/home/${USER_NAME}" 2>/dev/null || echo '?')"
-  owner_doc="$(stat -c '%U:%G' "$DOCROOT" 2>/dev/null || echo '?')"
-  if [[ "$owner_root" == "${USER_NAME}:${USER_NAME}" && "$owner_doc" == "${USER_NAME}:${USER_NAME}" ]]; then
-    ok "Home/docroot owned by ${USER_NAME}:${USER_NAME}"
-  else
-    warn "Ownership differs. Home: $owner_root  Docroot: $owner_doc"
-    note_warn
-    recommend "chown -R '${USER_NAME}:${USER_NAME}' '/home/${USER_NAME}'"
-  fi
-fi
+    if (file_put_contents_if_changed($poolFile, $pool, 0644)) {
+        $changedPools = true;
+    }
 
-# ---------- 6) .htaccess denials ----------
-echo -e "\n------ .htaccess Deny Rules ------"
-if [[ -f "$DOCROOT/.htaccess" ]]; then
-  if grep -Ei '^\s*(require\s+all\s+denied|deny\s+from\s+all|order\s+deny,allow\s*$)' "$DOCROOT/.htaccess" >/dev/null; then
-    warn ".htaccess contains a deny rule that can cause 403."
-    note_warn
-    recommend "sed -n '1,120p' '$DOCROOT/.htaccess'   # review and remove/adjust deny rules"
-  else
-    ok ".htaccess present; no obvious global deny found."
-  fi
-else
-  ok "No .htaccess in docroot (nothing here to deny access)."
-fi
+    // 5) Apache routing for this docroot → that pool
+    // We add a tiny include that only targets this docroot’s PHP files.
+    if (is_debian_like()) {
+        $siteConfBase = "php-fpm-{$user}.conf";
+        $siteConfPath = "{$perSiteConfDir}/{$siteConfBase}";
+    } else {
+        $siteConfBase = "php-fpm-{$user}.conf";
+        $siteConfPath = "{$perSiteConfDir}/{$siteConfBase}";
+    }
 
-# ---------- 7) Apache module sanity ----------
-echo -e "\n------ Apache Modules ------"
-if [[ -n "$APACHECTL" ]]; then
-  if $APACHECTL -M >/tmp/mods.txt 2>/dev/null; then
-    if grep -q 'rewrite_module' /tmp/mods.txt; then ok "mod_rewrite enabled."; else warn "mod_rewrite not enabled (not typical cause of 403, but needed for many apps)."; note_warn; recommend "a2enmod rewrite && apache2ctl configtest && systemctl reload apache2"; fi
-    if grep -q 'authz_core_module' /tmp/mods.txt; then ok "authz_core present."; else warn "authz_core missing; Apache authz may be broken."; note_warn; fi
-    rm -f /tmp/mods.txt
-  else
-    warn "Cannot list Apache modules (permission?)."
-    note_warn
-  fi
-fi
+    // Use FilesMatch inside a Directory block so it’s scoped to this docroot only.
+    $apacheSnippet = <<<APC
+# Managed by fix-permissions.php
+<Directory "{$docroot}">
+    AllowOverride All
+    Require all granted
+    <FilesMatch "\\.php$">
+        SetHandler "proxy:unix:{$sock}|fcgi://localhost/"
+    </FilesMatch>
+</Directory>
+APC;
 
-# ---------- 8) Global deny in apache2.conf vs vhost override ----------
-echo -e "\n------ Global Deny vs VHost Override ------"
-APACHE_MAIN_CONF=""
-[[ -f /etc/apache2/apache2.conf ]] && APACHE_MAIN_CONF="/etc/apache2/apache2.conf"
-[[ -z "$APACHE_MAIN_CONF" && -f /etc/httpd/conf/httpd.conf ]] && APACHE_MAIN_CONF="/etc/httpd/conf/httpd.conf"
+    if (file_put_contents_if_changed($siteConfPath, $apacheSnippet, 0644)) {
+        $changedApache = true;
+        if (is_debian_like()) {
+            $perSiteConfEnableCmd(basename($siteConfPath));
+        }
+    }
 
-if [[ -n "$APACHE_MAIN_CONF" ]]; then
-  if awk '
-      BEGIN{rootdeny=0}
-      /^[[:space:]]*#/ {next}
-      /<Directory[[:space:]]*\/[[:space:]]*>/ {inroot=1}
-      inroot && /Require[[:space:]]+all[[:space:]]+denied/ {rootdeny=1}
-      inroot && /<\/Directory>/ {inroot=0}
-      END{exit(rootdeny?0:1)}
-    ' "$APACHE_MAIN_CONF"; then
-    info "apache main conf: <Directory /> has 'Require all denied' (normal hardening)."
-    if (( DIR_BLOCK_OK == 0 )); then
-      warn "Your vhost may not be overriding the global deny."
-      note_warn
-      [[ -n "$VHOST_CONF" ]] && recommend "Add a <Directory ${DOCROOT}> block with 'Require all granted' to '$VHOST_CONF'"
-    fi
-  else
-    ok "No global <Directory /> deny detected."
-  fi
-fi
+    echo "=== Done $user ===\n\n";
+}
 
-# ---------- 9) SELinux / AppArmor hints ----------
-echo -e "\n------ SELinux / AppArmor ------"
-if have getenforce; then
-  mode="$(getenforce || true)"
-  info "SELinux: ${mode}"
-  if [[ "$mode" == "Enforcing" ]]; then
-    # Check context of docroot
-    if have ls; then
-      ctx="$(ls -Zd "$DOCROOT" 2>/dev/null || true)"
-      echo "Context: ${ctx:-unknown}"
-    fi
-    warn "If SELinux blocks Apache, set proper context on /home/*/public_html."
-    note_warn
-    cat <<'SEL'
-# RECOMMENDED COMMANDS (RHEL/AlmaLinux/CentOS):
-semanage fcontext -a -t httpd_sys_content_t "/home/[^/]*/public_html(/.*)?"
-restorecon -Rv /home/*/public_html
-# To test quickly (temporary):
-# setenforce 0   # then retry, and set back with: setenforce 1
-SEL
-  fi
-fi
+// Reload services only if needed
+if ($changedPools) {
+    echo "[INFO] Reloading PHP-FPM ($phpFpmService)\n";
+    service_reload($phpFpmService);
+} else {
+    echo "[OK]    PHP-FPM pools already up to date\n";
+}
 
-if have aa-status; then
-  info "AppArmor profiles:"
-  aa-status || true
-  warn "If apache2 is confined and denies /home access, allow it or move the site under /var/www."
-  note_warn
-  cat <<'AA'
-# RECOMMENDED (Ubuntu AppArmor):
-# echo "  /home/*/public_html/** r," | sudo tee -a /etc/apparmor.d/local/usr.sbin.apache2
-# systemctl reload apparmor
-AA
-fi
+if ($changedApache) {
+    echo "[INFO] Reloading Apache\n";
+    service_reload($apacheService);
+} else {
+    echo "[OK]    Apache config already up to date\n";
+}
 
-# ---------- Summary ----------
-echo
-echo "----------------------------------------"
-echo "Fix-permissions Summary for ${DOMAIN}"
-echo "Failures : $FAILS"
-echo "Warnings : $WARNS"
-echo "----------------------------------------"
-
-# Convenience next steps
-echo
-echo "Next steps (common fixes):"
-echo " - Ensure site is enabled: a2ensite '${DOMAIN}.conf' && apache2ctl configtest && systemctl reload apache2"
-echo " - Ensure traversal perms: chmod 755 /home '/home/${USER_NAME}' '${DOCROOT}'"
-echo " - Ensure ownership:       chown -R '${USER_NAME}:${USER_NAME}' '/home/${USER_NAME}'"
-echo " - Ensure modes:           find '${DOCROOT}' -type d -exec chmod 755 {} \\; ; find '${DOCROOT}' -type f -exec chmod 644 {} \\;"
-echo " - Add <Directory> block granting access if missing."
+echo "All done.\n";
