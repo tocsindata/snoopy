@@ -1,10 +1,22 @@
-#!/usr/bin/env bash
+#!/usr/bin/env bash 
 # project: USERSPICE-5-ENV-AUDIT (https://github.com/tocsindata/userspice-5-env-audit)
 # framework: Server readiness auditor for UserSpice 5 (audit-only; no mutations)
 # file: scripts/userspice5-audit.sh
 # date: 2025-09-17
 
 set -euo pipefail
+
+clear 
+
+echo "##########################################################"
+
+echo "##########################################################"
+
+echo "##########################################################"
+
+echo "##########################################################"
+
+echo "##########################################################"
 
 # -------------------------------#
 # Defaults (override via env/CLI)
@@ -704,8 +716,7 @@ fi
 if (( found_any == 0 )); then
   if (( APACHE == 1 || NGINX == 1 )); then
     warn "No document roots found in scanned vhost files. You may need elevated privileges or custom paths."
-    add_json "VHosts" "WARN" "No docroots found" "Check permissions or non-standard config paths." \
-             "Run apache2ctl -S (or httpd -S) and/or nginx -T as applicable."
+    add_json "VHosts" "WARN" "No docroots found" "Check permissions or non-standard config paths. Run apache2ctl -S (or httpd -S) and/or nginx -T as applicable."
     note_warn
     (( APACHE == 1 )) && echo "# RECOMMENDED COMMAND: apache2ctl -S   # or: httpd -S"
     (( NGINX == 1 )) && echo "# RECOMMENDED COMMAND: sudo nginx -T"

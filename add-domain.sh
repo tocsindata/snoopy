@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/env bash 
 set -euo pipefail
 
 # This script sets up an Apache vhost for a single domain and a matching (sanitized) system user.

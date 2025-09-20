@@ -1,19 +1,28 @@
 #!/usr/bin/env bash
+# project: ERGSS DevOps (https://github.com/tocsindata/ergss_project2025)
+# framework: independent ops script
+# file: /usr/local/sbin/cert.sh
+# date: 2025-09-19
+# copyright: Daniel Foscarini (www.tocsindata.com) info@tocsindata.com
+
+
 # cert.sh — Non-interactive Let's Encrypt manager for Apache (webroot)
-# Fixes staging/self-signed/mis-chained certs automatically
+# Fixes staging/self-signed/mis-chained certs automatically; now with
+# strong vhost discovery and preflight HTTP-01 webroot checks.
 
 set -euo pipefail
 
 #############################
 # Hard-coded configuration  #
 #############################
-CERT_EMAIL="admin@tocsindata.io"                # change if needed
+CERT_EMAIL="info@tocsindata.com"                # notifications only; any email is fine
 RENEW_DAYS=30                                   # renew when fewer days remain
 STAGING=0                                       # 1 = LE staging (testing only)
 CF_WAIT_SECS=60                                 # cloudflare settle probe
 APACHE_RELOAD_CMD="systemctl reload apache2"    # or: systemctl reload httpd
 FORCE_DISABLE_DEFAULT_SSL=1                     # disable default-ssl snakeoil if enabled
 LE_PROD_DIR="https://acme-v02.api.letsencrypt.org/directory"
+PREF_CHALLENGE="http-01"                        # force http-01 over webroot
 
 #############################
 # Helpers / Logging         #
@@ -33,6 +42,29 @@ if ! flock -n 9; then log "Another cert.sh is running. Exiting."; exit 0; fi
 have certbot || { err "certbot not found"; exit 1; }
 APACHECTL=""
 if have apache2ctl; then APACHECTL="apache2ctl"; elif have httpd; then APACHECTL="httpd"; else err "apache2ctl/httpd not found"; exit 1; fi
+have openssl || { err "openssl not found"; exit 1; }
+
+# --- HOTFIX: sanity checks for SSL listener + reachability ---
+# 1) local Apache listener on 443?
+if ! ss -ltn 2>/dev/null | grep -q ':443 '; then
+  warn "No local listener on 443 – enable ssl_module and add 'Listen 443'."
+fi
+
+# 2) external reachability (AWS SG / NACL / firewall)
+PUBIP="$(curl -s --max-time 5 ifconfig.me || true)"
+if [[ -n "$PUBIP" ]]; then
+  if ! nc -z -w3 "$PUBIP" 443 2>/dev/null; then
+    warn "External check FAILED – $PUBIP:443 not reachable. Fix SG/NACL/firewall."
+  else
+    log "External check OK – $PUBIP:443 reachable."
+  fi
+else
+  warn "Could not detect public IP for external reachability test."
+fi
+
+
+# Small utilities
+trim(){ sed 's/^[[:space:]]*//;s/[[:space:]]*$//' ; }
 
 # --- Cert utils ---
 days_until_expiry() {
@@ -50,7 +82,7 @@ days_until_expiry() {
 cert_sans() {
   local live_dir="$1" crt="${live_dir}/cert.pem"
   [[ -f "$crt" ]] || { echo ""; return; }
-  openssl x509 -noout -text -in "$crt"      | awk '/X509v3 Subject Alternative Name/{flag=1; next} /X509v3/{flag=0} flag'      | tr ',' '\n' | sed -n 's/.*DNS:\s*\(.*\)$/\1/p' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'      | sort -u | tr '\n' ' '
+  openssl x509 -noout -text -in "$crt"     | awk '/X509v3 Subject Alternative Name/{flag=1; next} /X509v3/{flag=0} flag'     | tr ',' '\n' | sed -n 's/.*DNS:\s*\(.*\)$/\1/p' | trim | sort -u | tr '\n' ' '
 }
 
 sets_equal() {
@@ -60,11 +92,41 @@ sets_equal() {
   [[ "$A" == "$B" ]]
 }
 
+# --- Network/DNS helpers ---
+get_addrs() {
+  # Prints both IPv4 and IPv6 if available, one per line.
+  local host="$1"
+  if have getent; then
+    getent ahosts "$host" 2>/dev/null | awk '{print $1}' | sort -u
+  elif have dig; then
+    (dig +short A "$host"; dig +short AAAA "$host") 2>/dev/null
+  else
+    # Fallback: try IPv4 only via ping
+    ping -c1 -W1 "$host" >/dev/null 2>&1 && getent hosts "$host" | awk '{print $1}' | sort -u || true
+  fi
+}
+
+is_cloudflare() {
+  # Best-effort: check HTTP headers for CF
+  local host="$1"
+  have curl || return 1
+  curl -sSI --max-time 6 "http://${host}/" 2>/dev/null | grep -qiE 'server:\s*cloudflare|^cf-ray:' && return 0 || return 1
+}
+
 # --- Apache parsing ---
 collect_apache_confs() {
+  # Prefer DUMP_VHOSTS for consistent path extraction across distros
   local out="/tmp/certsh_vhosts.txt"
-  if $APACHECTL -S >"$out" 2>/dev/null; then
-    awk '/namevhost|port [0-9]+ namevhost/ {conf=$0; sub(/^.*\(/,"",conf); sub(/:[0-9]+\).*$/,"",conf); print conf}' "$out"        | sort -u
+  if $APACHECTL -t -D DUMP_VHOSTS >"$out" 2>/dev/null; then
+    # Typical lines: "port 80 namevhost example.com (/etc/apache2/sites-enabled/example.conf:1)"
+    awk '
+      /\(.*\.conf:[0-9]+\)/ {
+        m=$0
+        sub(/^.*\(/,"",m); sub(/:[0-9]+\).*$/,"",m);
+        print m
+      }' "$out" | sort -u
+  elif $APACHECTL -S >"$out" 2>/dev/null; then
+    awk '/namevhost|port [0-9]+ namevhost/ {conf=$0; sub(/^.*\(/,"",conf); sub(/:[0-9]+\).*$/,"",conf); print conf}' "$out" | sort -u
   else
     find /etc/apache2/sites-enabled /etc/apache2/sites-available /etc/httpd/conf.d -maxdepth 1 -type f -name "*.conf" 2>/dev/null || true
   fi
@@ -151,8 +213,8 @@ patch_vhost_to_le() {
       BEGIN{in443=0; hasFile=0; hasKey=0}
       /^[[:space:]]*<VirtualHost/ { in443 = ($0 ~ /:443/); hasFile=0; hasKey=0 }
       {
-        if (in443 && $0 ~ /^[[:space:]]*SSLCertificateFile[[:space:]]+/)   { print "    SSLCertificateFile " FULL; hasFile=1; next }
-        if (in443 && $0 ~ /^[[:space:]]*SSLCertificateKeyFile[[:space:]]+/){ print "    SSLCertificateKeyFile " KEY; hasKey=1; next }
+        if (in443 && $0 ~ /^[[:space:]]*SSLCertificateFile[[:space:]]+/)    { print "    SSLCertificateFile " FULL; hasFile=1; next }
+        if (in443 && $0 ~ /^[[:space:]]*SSLCertificateKeyFile[[:space:]]+/) { print "    SSLCertificateKeyFile " KEY; hasKey=1; next }
         if (in443 && $0 ~ /^[[:space:]]*SSLCertificateChainFile[[:space:]]+/){ next }
         print $0
       }
@@ -172,16 +234,16 @@ patch_vhost_to_le() {
 # --- Served vs local checks ---
 served_issuer() {
   local host="$1"
-  openssl s_client -connect "${host}:443" -servername "$host" </dev/null 2>/dev/null      | openssl x509 -noout -issuer 2>/dev/null | sed 's/^issuer=//'
+  openssl s_client -connect "${host}:443" -servername "$host" </dev/null 2>/dev/null     | openssl x509 -noout -issuer 2>/dev/null | sed 's/^issuer=//'
 }
 serve_fingerprint() {
   local host="$1"
-  openssl s_client -connect "${host}:443" -servername "$host" </dev/null 2>/dev/null      | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//; s/://g'
+  openssl s_client -connect "${host}:443" -servername "$host" </dev/null 2>/dev/null     | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//; s/://g'
 }
 local_fingerprint() {
   local live_dir="$1"
   [[ -f "${live_dir}/cert.pem" ]] || { echo ""; return; }
-  openssl x509 -in "${live_dir}/cert.pem" -noout -fingerprint -sha256 2>/dev/null      | sed 's/^.*=//; s/://g'
+  openssl x509 -in "${live_dir}/cert.pem" -noout -fingerprint -sha256 2>/dev/null     | sed 's/^.*=//; s/://g'
 }
 issuer_string() {
   local pem="$1"
@@ -192,9 +254,8 @@ looks_like_staging_or_untrusted() {
   local pem="$1" iss
   iss="$(issuer_string "$pem")"
   [[ -z "$iss" ]] && return 0
-  # treat any STAGING/Fake/Happy Hacker or non-LE issuer as untrusted
   if echo "$iss" | grep -qiE 'staging|fake|happy hacker'; then return 0; fi
-  if ! echo "$iss" | grep -qi "Let's Encrypt"; then return 0; fi
+  if ! echo "$iss" | grep -qi " Lets Encrypt"; then return 0; fi
   return 1
 }
 https_ok() {
@@ -202,6 +263,38 @@ https_ok() {
   have curl || return 0
   local code; code="$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' "https://${d}/" || echo 000)"
   [[ "$code" =~ ^2|^3|^401|^403 ]]
+}
+
+# --- Preflight HTTP-01 probe ---
+# Writes a random file to the exact webroot and fetches it via http://domain/…
+precheck_webroot() {
+  local domain="$1" webroot="$2"
+  local acdir="${webroot%/}/.well-known/acme-challenge"
+  local token="$(tr -dc 'a-z0-9' </dev/urandom | head -c 32)"
+  local body="certsh-${token}"
+  mkdir -p "$acdir"
+  echo "$body" > "${acdir}/${token}.txt"
+  chmod 755 "${webroot%/}/.well-known" "${acdir}" || true
+  chmod 644 "${acdir}/${token}.txt" || true
+
+  local url="http://${domain}/.well-known/acme-challenge/${token}.txt"
+  local got=""
+  if have curl; then
+    got="$(curl -sS --max-time 8 "$url" || true)"
+  else
+    # crude fallback
+    got="$(wget -q -O- "$url" 2>/dev/null || true)"
+  fi
+
+  if [[ "$got" != "$body" ]]; then
+    warn "[$domain] Webroot precheck FAILED → $url - expected token not served."
+    warn "[$domain] Check: vhost points to $webroot, perms, index redirects, Cloudflare proxy, and port 80 reachability."
+    rm -f "${acdir}/${token}.txt"
+    return 1
+  fi
+  log "[$domain] Webroot precheck OK → $url"
+  rm -f "${acdir}/${token}.txt"
+  return 0
 }
 
 ########################################
@@ -215,7 +308,7 @@ mapfile -t CONF_LIST < <(collect_apache_confs)
 for conf in "${CONF_LIST[@]}"; do
   while IFS='|' read -r primary aliases doc80 doc443 _; do
     [[ -z "$primary" ]] && continue
-    aliases="$(tr -s ' ' <<<"$aliases" | sed 's/^ *//;s/ *$//')"
+    aliases="$(tr -s ' ' <<<"$aliases" | trim)"
     local_root="$doc80"; [[ -z "$local_root" ]] && local_root="$doc443"; [[ -z "$local_root" ]] && local_root="/var/www/html"
     prev="${GROUP_ALIASES[$primary]:-}"
     GROUP_ALIASES["$primary"]="$(printf "%s %s\n" "$prev" "$aliases" | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')"
@@ -239,6 +332,15 @@ for primary in "${!GROUP_DOCROOT[@]}"; do
   fullchain="${live_dir}/fullchain.pem"
   need_issue=0
 
+  # Advisory: IPv6 + Cloudflare
+  addrs="$(get_addrs "$primary" | tr '\n' ' ' | trim || true)"
+  if [[ "$addrs" == *:*:* ]] || echo "$addrs" | grep -q ':'; then
+    warn "[$primary] AAAA present → ${addrs}. Ensure IPv6 serves same vhost/content for HTTP-01."
+  fi
+  if is_cloudflare "$primary"; then
+    warn "[$primary] Cloudflare proxy detected. For webroot http-01, turn proxy OFF (grey-cloud) until issuance, or switch to DNS-01."
+  fi
+
   # Local validity checks
   if [[ ! -f "$fullchain" ]]; then
     log "[$primary] No existing certificate; will issue."
@@ -251,18 +353,16 @@ for primary in "${!GROUP_DOCROOT[@]}"; do
     looks_like_staging_or_untrusted "${live_dir}/cert.pem" && { log "[$primary] Local issuer is staging/untrusted; will replace with production."; need_issue=1; }
   fi
 
-  # Force fix if SERVED cert is not **production** LE (e.g., staging/self-signed/mis-chained)
+  # Force fix if SERVED cert is not production LE
   srv_iss="$(served_issuer "$primary" || true)"
   log "[$primary] Served issuer: ${srv_iss:-unknown}"
-  if [[ -z "$srv_iss" ]] || echo "$srv_iss" | grep -qiE 'staging|fake|happy hacker' || ! echo "$srv_iss" | grep -qi "Let's Encrypt"; then
+  if [[ -z "$srv_iss" ]] || echo "$srv_iss" | grep -qiE 'staging|fake|happy hacker' || ! echo "$srv_iss" | grep -qi "Lets Encrypt"; then
     log "[$primary] Served issuer not production Let’s Encrypt; forcing production issuance."
     need_issue=1
   fi
 
   if (( need_issue == 0 )); then
-    # still ensure vhost uses fullchain/privkey and snakeoil is off
     [[ -f "$fullchain" ]] && { patch_vhost_to_le "$primary" || true; maybe_disable_default_ssl || true; }
-    # served vs local fingerprint sanity
     sfp="$(serve_fingerprint "$primary" || true)"; lfp="$(local_fingerprint "$live_dir" || true)"
     log "[$primary] Served fp: ${sfp:-?} | Local fp: ${lfp:-?}"
     if [[ -n "$sfp" && -n "$lfp" && "$sfp" != "$lfp" ]]; then
@@ -274,18 +374,33 @@ for primary in "${!GROUP_DOCROOT[@]}"; do
   fi
 
   # Build certbot args (force production unless STAGING=1)
-  args=( certonly --non-interactive --agree-tos --email "$CERT_EMAIL" --cert-name "$primary" -a webroot )
+  args=( certonly --non-interactive --agree-tos --email "$CERT_EMAIL" --cert-name "$primary" -a webroot --preferred-challenges "$PREF_CHALLENGE" )
   (( STAGING == 1 )) && args+=( --staging ) || args+=( --server "$LE_PROD_DIR" )
-  for d in $domains; do wr="${GROUP_PER_DOMAIN_WEBROOT[$d]:-$docroot}"; args+=( -w "$wr" -d "$d" ); done
+
+  log "[$primary] Domains → $domains"
+  # Preflight every domain with its exact webroot
+  preflight_ok=1
+  for d in $domains; do
+    wr="${GROUP_PER_DOMAIN_WEBROOT[$d]:-$docroot}"
+    wr="${wr%/}"
+    if [[ ! -d "$wr" ]]; then warn "[$d] Webroot path not found: $wr"; preflight_ok=0; fi
+    log "[$d] Using webroot: $wr"
+    if ! precheck_webroot "$d" "$wr"; then preflight_ok=0; fi
+    args+=( -w "$wr" -d "$d" )
+  done
+  if (( preflight_ok == 0 )); then
+    err "[$primary] One or more webroot prechecks failed. Aborting issuance for this group."
+    continue
+  fi
 
   log "[$primary] Running certbot…"
   if ! certbot "${args[@]}" --expand --force-renewal; then
-    err "[$primary] certbot failed. Will retry on next run."
+    err "[$primary] certbot failed. See /var/log/letsencrypt/letsencrypt.log"
     continue
   fi
   ANY_CHANGED=1
 
-  # Make future renewals use production (fix any old staging lineage)
+  # Ensure renewal uses production (fix any old staging lineage)
   if [[ -f "/etc/letsencrypt/renewal/${primary}.conf" ]]; then
     sed -i 's#acme-staging-v02\.api\.letsencrypt\.org/directory#acme-v02.api.letsencrypt.org/directory#g' "/etc/letsencrypt/renewal/${primary}.conf" || true
     sed -i 's#^server\s*=.*#server = https://acme-v02.api.letsencrypt.org/directory#' "/etc/letsencrypt/renewal/${primary}.conf" || true
@@ -304,7 +419,7 @@ for primary in "${!GROUP_DOCROOT[@]}"; do
   fi
 
   # Cloudflare settle probe (non-blocking)
-  if have curl && curl -sSI --max-time 6 "http://${primary}/" 2>/dev/null | grep -qiE 'server:\s*cloudflare|^cf-ray:'; then
+  if is_cloudflare "$primary"; then
     warn "[$primary] Cloudflare proxy detected; waiting ${CF_WAIT_SECS}s, then probing."
     sleep "$CF_WAIT_SECS"
     https_ok "$primary" && log "[$primary] HTTPS OK after CF settle." || warn "[$primary] HTTPS check failed post-CF; may need more time."
@@ -318,4 +433,3 @@ if (( ANY_CHANGED == 0 )); then
 fi
 
 exit 0
-

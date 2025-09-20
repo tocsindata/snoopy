@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/env bash 
 # fix-permissions.sh — diagnose 403/permissions/vhost issues for a domain
 # Safe/read-only: prints RECOMMENDED COMMANDs, does not change system state.
 
