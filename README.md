@@ -1,249 +1,293 @@
-# Snoopy — LAMP bootstrap & ops toolkit
+# `scripts/audit.sh` — UserSpice 5 Environment Audit
 
-This repo provides opinionated Bash scripts to bootstrap a LAMP-like stack, manage updates, create/restores of backups, and import targeted files from external repos. It’s designed for Ubuntu servers (Jammy+), runs with clear logging, and uses conservative safety defaults.
+## Overview
 
----
+A bash-only, read-only auditor that validates a server’s readiness to host **UserSpice 5**. It checks PHP version/extensions and `php.ini` thresholds, web-server rewrite/HTTPS readiness, system resources, application directory permissions, optional RDS TCP reachability, and enumerates Apache/Nginx vhosts. Outputs human-readable results and (optionally) JSON.
 
-## TL;DR (Quick Start)
+## What it checks
 
-1. **Put scripts** in your scripts directory (e.g., `/home/<user>/scripts/`).
-2. **Edit `config.sh`** (variables only). Set all required values.
-3. **Run the installer** as root:
+* **PHP**: CLI presence, version (warn on ≥8.4), required/recommended extensions, `php.ini` (`memory_limit`, `post_max_size`, `upload_max_filesize`, `date.timezone`), session path.
+* **Web server**: Apache `mod_rewrite`, Nginx `try_files` hint.
+* **System resources**: CPU cores, RAM, disk space, inode headroom, `ulimit -n`.
+* **App path (optional)**: Presence of `.htaccess`/`index.php`; writability of `users`, `usersc`, `images`, `uploads`, `cache`.
+* **RDS reachability (optional)**: TCP probe to `host:port` using `nc` or `/dev/tcp`.
+* **VHosts**: Apache/Nginx docroots discovered from live configs.
+* **HTTPS/SSL**: Apache `mod_ssl`, :443 listener, firewall (ufw/firewalld) status, per-vhost cert/key paths, Let’s Encrypt presence/expiry, live HTTP/HTTPS probes, Cloudflare proxy hints, redirect guidance.
 
-   ```bash
-   sudo /home/<user>/scripts/install.sh
-   ```
-4. **(Optional) Create import manifest:** `/home/<user>/imports/manifest.psv`.
-5. **Add cron jobs** (repo check & backup) as shown below.
+## Usage
 
-> **Note:** `config.sh` must contain variables only (no logic). All derivation/logic lives in the scripts.
-
----
-
-## Directory Layout (suggested)
-
-```
-/home/<user>/
-  ├─ scripts/
-  │   ├─ install.sh                # LAMP + vhost + repo deploy
-  │   ├─ functions.sh              # shared helpers (no set -e here)
-  │   ├─ snoopy-repo-check.sh      # cron-safe remote HEAD checker
-  │   ├─ snoopy-backup.sh          # root-only, daily backup
-  │   ├─ snoopy-restore.sh         # root-only, dry-run by default
-  │   └─ snoopy-import.sh          # targeted single-file imports
-  ├─ imports/
-  │   └─ manifest.psv              # pipe-separated import rules
-  └─ ... (web root under /home/<user> per mode below)
-
-/var/log/snoopy/                    # central logs (auto-pruned >7 days)
-/var/lock/                          # locks: snoopy.* (TTL auto-unlock)
-/root/backups/<user>/               # full backups (keep last 7)
-/root/backups/<user>/singlefile/    # per-file import backups (keep 12)
-/tmp/snoopy/                        # tmp/state (SNOOPY_TMP_DIR)
+```bash
+scripts/audit.sh \
+  [--app-path /var/www/html] \
+  [--rds mydb.x.rds.amazonaws.com:3306] \
+  [--json]
 ```
 
----
+## Notable Defaults (override via env)
 
-## Files & Scripts
+* `PHP_BIN=php`, minimum PHP **8.1**, warn on **8.4+**
+* Size floors: `MIN_PHP_MEMORY_MB=128`, `MIN_PHP_POST_MB=8`, `MIN_PHP_UPLOAD_MB=8`
+* System floors: `MIN_RAM_MB=1024`, `MIN_DISK_MB=1024`, `MIN_INODES_PCT_FREE=5`, `MIN_ULIMIT_NOFILE=1024`
+* Web user guess: `WEB_USER_GUESS=www-data`
 
-### `config.sh` (variables only)
+## Output & Exit Codes
 
-Define all configuration here — **no logic**. Examples of key sections:
+* Prints **PASS/WARN/FAIL** with suggested remediation commands (apt/yum/systemctl/Certbot).
+* `--json` adds a machine-readable array of findings.
+* **Exit 0** if no FAILs; **Exit 1** if any FAIL is recorded.
 
-* **General:** `SNOOPY_HOME_USERNAME`, `SNOOPY_USER`, `SNOOPY_GROUP`, `SNOOPY_HOME`, `SNOOPY_BIN_DIR`, `SNOOPY_SCRIPTS_DIR`, `SNOOPY_TMP_DIR`.
-* **Web Root:** `SNOOPY_WEB_ROOT_MODE` (`home|public_html|public`), `SNOOPY_WEB_ROOT_DIR` (installer will derive if NULL), `SNOOPY_DOMAIN`.
-* **Apache2:** `APACHE_CONF_DIR`, `ADMINER_PASS_FILE_NAME`.
-* **PHP:** `INSTALL_PHP` (`true/false`), `PHP_VERSION` (e.g., `8.2`), `PHP_EXTRA_MODULES` (space-separated).
-* **GitHub:** `GITHUB_REPO_URL`, `GITHUB_BRANCH`, `GITHUB_CLONE_DIR`, `GITHUB_REPO_PUBLIC`, `GITHUB_ACCESS_TOKEN` (if private).
-* **Logging:** `LOG_DIR`, `LOG_LEVEL`, `LOG_RETENTION_DAYS` (script prunes >7 days).
-* **Notifications:** `SEND_EMAIL`, `EMAIL_TO`, `EMAIL_SUBJECT`, `EMAIL_BODY`, `SEND_SLACK`, `SLACK_WEBHOOK_URL`, `SLACK_MESSAGE` (used as a **header/prefix** for all script notices).
+## Requirements
 
-> Required vs Optional variables are validated at runtime via `verify`, `verify_optional`, and `require_when` in `functions.sh`.
+* Linux shell with standard tools; best results when `php`, `openssl`, `curl`, `apache2ctl/httpd`, `nginx`, `ss/netstat`, and `nc` are available (the script falls back where possible).
+* Sufficient permissions to read web-server configs for full vhost discovery.
 
-### `functions.sh`
 
-Shared helpers: logging, `check_root`, `parse_bool`, `verify/verify_optional/require_when`, `ensure_web_root`, `create_apache_vhost`, package installers, repo clone/update, reboot notifications, etc. Purposefully **no `set -e`** here; only entrypoints use `set -e`.
+# `add-domain.sh` — Single-Domain Apache + System User Setup
 
-### `install.sh`
+## What this script does
 
-One-time (or occasional) **bootstrap**:
+* Validates an input **FQDN** and derives a **sanitized Linux username** from it (dots → underscores, lowercase).
+* Creates a **system user/group** and home at `/home/<username>`, with web root at `/home/<username>/public_html`.
+* Drops a simple `index.html` if none exists.
+* Generates `/etc/apache2/sites-available/<domain>.conf` with **:80** and **:443** vhosts (snakeoil certs).
+* Enables **mod\_rewrite** and **mod\_ssl**, enables the site, runs `apache2ctl configtest`, and **reloads Apache**.
+* Saves a randomly generated password to `/root/<username>-password.txt` (mode `600`).
 
-* Validates config and derives `SNOOPY_WEB_ROOT_DIR` from `SNOOPY_WEB_ROOT_MODE` if needed.
-* Installs base packages, Apache, and optional PHP stack.
-* Ensures web root exists; writes Apache vhost for `SNOOPY_DOMAIN` with `DocumentRoot` set to the derived web root; reloads Apache.
-* Clones or updates the configured repo and deploys it to the web root (excludes `.git`).
-* Handles reboot-required notifications at the end.
+## Requirements
 
-### `snoopy-repo-check.sh`
+* Run as **root** on **Debian/Ubuntu**-style Apache layout (`apache2ctl`, `a2enmod`, `a2ensite` available).
+* Packages: `apache2`, `openssl` (for password generation).
+* DNS should already point the domain to this server (needed later for real TLS).
 
-**Cron-safe** remote HEAD check:
+## Usage
 
-* Compares remote `HEAD` (for `GITHUB_BRANCH`) vs last-seen SHA under `$SNOOPY_TMP_DIR/state/repo/`.
-* Notifies Slack/email when new commits appear or when the repo is “quiet” for too long.
-* **Default quiet threshold:** 30 days (override via `--notify-if-quiet NDAYS`).
-* **Lock:** `/var/lock/snoopy.repo-check.lock` with TTL **2h** auto-unlock.
-
-### `snoopy-backup.sh` (root-only)
-
-Daily **full backup** of key assets:
-
-* Snapshots web root; **keeps directory stubs** for caches/logs but **excludes their contents**.
-* Saves Apache vhost (and enabled/disabled state), minimal PHP INIs, crontabs, and scripts.
-* Writes `manifest.json`, `filelist.txt`, `checksums.sha256`.
-* **Retention:** keep last **7** backups; prune older.
-* **Lock:** `/var/lock/snoopy.backup.lock` (TTL **12h**).
-
-### `snoopy-restore.sh` (root-only)
-
-Safe **restore** tool (dry-run by default):
-
-* Mode: `all`, `webroot`, or `vhost`.
-* Dry-run shows changes without applying. Use `--apply` to execute.
-* Web root restores are **atomic** (rsync then swap) and reset owners/permissions.
-
-### `snoopy-import.sh` (root-only)
-
-**Targeted single-file import** from other repos using a manifest:
-
-* Supports `--list`, `--dry-run <name|all>`, `--apply <name>`, `--apply-all`.
-* Uses **sparse checkout** to fetch only the specified file(s).
-* Destination must be under `/home/<user>/`.
-* Backs up each destination to `/root/backups/<user>/singlefile/` and keeps **12** most recent per dest.
-* **Lock (cron mode):** `/var/lock/snoopy.import.lock` (TTL **1h**).
-
----
-
-## Import Manifest (pipe-separated)
-
-**Path:** `/home/<user>/imports/manifest.psv`
-
-**Columns (pipe `|` separated, fixed order):**
-
-```
-name | repo_url | ref | src_path | dest_path | owner | group | mode | post_cmd | repo_public | repo_token
+```bash
+sudo ./vhost-one.sh example.yourdomain.com
+# or run without arg and follow the prompt
 ```
 
-* `name`: short unique id for the rule
-* `repo_url`: HTTPS Git repo URL (can differ from main repo)
-* `ref`: branch, tag, or commit SHA to fetch
-* `src_path`: path inside the repo (e.g., `public_html/index.php`)
-* `dest_path`: absolute path (must resolve under `/home/<user>`)
-* `owner`, `group`, `mode`: ownership/permissions to set (optional but recommended)
-* `post_cmd`: optional shell command after install (e.g., `systemctl reload apache2`)
-* `repo_public`: `true` for public, otherwise `false`
-* `repo_token`: literal token if private; `true` to reuse **global** `GITHUB_ACCESS_TOKEN` from config; `false`/`NULL` for none
+## Files/paths created
 
-**Examples:**
+* User & home: `/home/<sanitized-username>/`
+* Web root: `/home/<sanitized-username>/public_html/`
+* VHost: `/etc/apache2/sites-available/<domain>.conf`
+* Password (if user newly created): `/root/<sanitized-username>-password.txt`
 
-```
-# name | repo_url | ref | src_path | dest_path | owner | group | mode | post_cmd | repo_public | repo_token
-prod-index | https://github.com/org/private-repo.git | main | public_html/index.php | /home/<user>/public/index.php | www-data | www-data | 0644 | systemctl reload apache2 | false | <READ_ONLY_TOKEN>
-favicon    | https://github.com/org/public-assets.git | v1.2.3 | assets/favicon.ico    | /home/<user>/public/favicon.ico | www-data | www-data | 0644 | NULL | true | false
-```
+## Notes & next steps
 
-> The import script never prints tokens. It performs atomic writes and keeps per-destination backups (12 most recent).
+* The :443 vhost uses **snakeoil** certs for bootstrapping. Replace with Let’s Encrypt:
 
----
-
-## Cron Jobs
-
-Edit with `crontab -e` (as the appropriate user):
-
-* **Repo check (service user):** once daily at 04:17
-
-  ```cron
-  17 4 * * * /home/<user>/scripts/snoopy-repo-check.sh --notify-if-quiet 30 >> /dev/null 2>&1
+  ```bash
+  sudo certbot --apache -d <domain>
   ```
+* If `a2enmod`/`a2ensite` are missing, enable modules/sites manually and reload Apache.
+* Re-running is **idempotent** for user, dirs, modules, and site enablement; it won’t clobber existing files.
 
-* **Full backup (root):** once daily at 03:12
 
-  ```cron
-  12 3 * * * /home/<user>/scripts/snoopy-backup.sh >> /dev/null 2>&1
-  ```
+# `git-pull-userspice.sh` — Read Me (Short)
 
-> `snoopy-import.sh` is usually run ad hoc. If you schedule it, keep the lock and TTL in mind and prefer `--apply-all` with a small window.
+## Purpose
 
----
+Provision a clean **UserSpice 5** codebase into `/home/<USER>/public_html` from your fork, and apply canonical file/dir permissions suitable for production.
 
-## Locks, Logs, and State
+## What it does
 
-* **Locks** live under `/var/lock/` with per-script names and **auto-unlock** if older than a TTL.
+1. Enumerates `/home/*` and prompts you to select a target account.
+2. Ensures `public_html` exists; if non-empty, interactively offers to **wipe all contents**.
+3. Clones `https://github.com/tocsindata/UserSpice5.git` into the target directory.
+4. Sets ownership to `<USER>:www-data`.
+5. Applies secure defaults: **dirs 755**, **files 644**.
+6. Grants required writability:
 
-  * repo-check: **2h**
-  * backup: **12h**
-  * import: **1h**
-* **Logs** live under `$LOG_DIR` (default `/var/log/snoopy`) and are **auto-pruned >7 days**.
-* **State** files live under `$SNOOPY_TMP_DIR` (e.g., last-seen remote SHA for repo-check).
-* **Slack header:** `SLACK_MESSAGE` is a prefix; each script appends a specific message (e.g., `“… — repo-check: new commits on main”`).
+   * `users/init.php` → **664** (installer needs write)
+   * `usersc/plugins/`, `usersc/widgets/` → **2775** (setgid, collaborative writes)
 
----
+## Requirements
 
-## Backup Details
+* Linux with `bash` and `git`.
+* Run with sufficient privileges to chown/chmod under `/home/<USER>`.
+* Existing user home at `/home/<USER>`.
 
-* Included:
+## Usage
 
-  * Web root (from `SNOOPY_WEB_ROOT_DIR`)
-  * Apache vhost `sites-available/<domain>.conf` + enabled/disabled state
-  * PHP Apache INIs under `/etc/php/*/apache2/` (if present)
-  * Crontabs for root and service user
-  * `config.sh`, `functions.sh`, and all `snoopy-*.sh` scripts
-  * A snapshot copy of `imports/manifest.psv`
-* **Excludes:** contents of any directories matching: `cache/`, `caches/`, `tmp/`, `log/`, `logs/`, `security_log/` (the folders themselves are kept)
-* **Retention:** last **7** runs (daily). Pruning happens at the end of a successful backup.
+```bash
+sudo ./git-pull-userspice.sh
+# follow the prompt to select the target account
+```
 
----
+## Outputs & Paths
 
-## Restore Details
+* Install path: `/home/<USER>/public_html`
+* Repo: `tocsindata/UserSpice5`
 
-* Default is **dry-run**. Use `--apply` to write.
-* Modes: `all` (webroot+vhost), `webroot`, `vhost`.
-* Respects ownership/permissions exactly as captured.
-* Webroot sync is atomic and followed by ownership fix.
+## Post-install Note
 
----
+After completing the UserSpice web installer, you **may** tighten:
 
-## Install Details
+```bash
+chmod 644 /home/<USER>/public_html/users/init.php
+```
 
-* **Deriving web root:** If `SNOOPY_WEB_ROOT_DIR` is `NULL`, `install.sh` derives it from `SNOOPY_WEB_ROOT_MODE` (`home|public_html|public`).
-* **Apache vhost:** DocumentRoot is the derived web root; `AllowOverride All`, `Options -Indexes +FollowSymLinks` by default.
-* **PHP:** If `INSTALL_PHP=true`, installs `PHP_VERSION` plus commonly used modules. On Jammy, you may need the Ondřej PPA for newer versions.
-* **Repo deploy:** Clones/updates to `GITHUB_CLONE_DIR`, then rsyncs into the web root (excludes `.git`).
+## Safety
 
----
+* Destructive when confirmed: will **delete all contents of `public_html`** if you agree.
+* Script is idempotent regarding directory creation and permission application.
 
-## Safety & Security
 
-* **Run as root** for backup/restore/import. Repo-check can run as the service user.
-* **Tokens:** Allowed as literals in the import manifest; never printed to logs. For public imports set `repo_public=true` and `repo_token=false`.
-* **Destination allow-list:** Imports must resolve under `/home/<user>/`.
-* **Locks:** Prevent overlapping runs; stale locks are auto-cleared according to TTL.
+# `domain-remove.sh` — Read Me (Short)
 
----
+## Purpose
 
-## Troubleshooting
+Safely dismantle an Apache vhost for a given domain and, if desired, remove the associated **sanitized system user** and home directory created by your setup workflow.
 
-* **PHP install fails:** Your Ubuntu release may need the `ppa:ondrej/php` PPA. Add it, then re-run `install.sh`.
-* **Apache reload errors:** Check `/var/log/apache2/error.log` and the vhost file in `sites-available`.
-* **Repo auth issues:** Verify `GITHUB_REPO_PUBLIC` and token placement (`GITHUB_ACCESS_TOKEN` in config, or per-entry tokens in manifest).
-* **Import skipped:** Ensure `dest_path` resolves under `/home/<user>` and `src_path` exists in the repo/ref.
-* **Quiet repo alerts:** Adjust with `--notify-if-quiet NDAYS` on the cron line.
+## What it does
 
----
+* Validates the **FQDN**, derives the **sanitized username** (lowercase; dots → underscores).
+* **Disables** the Apache site (`a2dissite`), **backs up** the vhost file to `/root/vhost-backups/<domain>.conf.<timestamp>`, then **removes** it.
+* Runs `apache2ctl configtest` and **reloads Apache**.
+* Optionally **deletes the system user** (via `userdel -r`) and the `/home/<user>/public_html` tree.
+* Optionally removes the saved password file and **domain-specific Apache logs**.
 
-## Typical Workflow
+## Safety & Confirmation
 
-1. Fill out `config.sh` with required values.
-2. Run `install.sh` as root to bootstrap Apache/PHP, vhost, and deploy the main repo.
-3. Add `snoopy-repo-check.sh` and `snoopy-backup.sh` to cron.
-4. Create `imports/manifest.psv` to manage targeted file imports; use `snoopy-import.sh --list/--dry-run/--apply` as needed.
-5. Use `snoopy-restore.sh` (dry-run first) to roll back to a prior backup if needed.
+* Multiple interactive prompts guard destructive steps:
 
----
+  * Remove vhost?
+  * Delete system user and home?
+  * Delete stored password file?
+  * Delete Apache logs?
+* Extra sanity checks prevent accidental deletion (e.g., refuses to act on `root`).
 
-## Conventions
+## Requirements
 
-* `install.sh` and other entrypoints use `set -e` (fail fast). Shared `functions.sh` does **not**.
-* All scripts use `tee` to log to `$LOG_DIR` and prune logs >7 days.
-* All cron-able scripts use `/var/lock/snoopy.*` with TTL-based auto-unlock.
+* Run as **root** on Debian/Ubuntu Apache layout (requires `apache2ctl`, `a2dissite`, `systemctl`).
+* The domain’s vhost file path: `/etc/apache2/sites-available/<domain>.conf`.
 
----
+## Usage
+
+```bash
+sudo ./domain-remove.sh <domain.example.com>
+# or run without an argument and follow the prompts
+```
+
+## Affected Paths (typical)
+
+* VHost: `/etc/apache2/sites-available/<domain>.conf` (backed up, then removed)
+* Site link: `/etc/apache2/sites-enabled/<domain>.conf` (disabled)
+* User home: `/home/<sanitized-username>/` (optional removal)
+* Password file: `/root/<sanitized-username>-password.txt` (optional removal)
+* Logs: `/var/log/apache2/<domain>_*.log` (optional removal)
+
+## Notes
+
+* This script mirrors the inverse of your `setup.sh`/vhost-creation workflow.
+* After vhost removal, ensure DNS/CDN (e.g., Cloudflare) is updated if the domain is being decommissioned.
+
+
+# `update-php.sh` — Short Read Me
+
+## Purpose
+
+Automate installation or upgrade of **PHP** to a specified or auto-detected **stable** version, including common extensions, across Debian/Ubuntu (APT) and RHEL/Alma/Rocky/Amazon Linux (DNF). Supports **mod\_php** (Ubuntu/Debian) and **php-fpm** modes.
+
+## Key Features
+
+* **Version selection**: `--version X.Y` or `--version X.Y.Z`; otherwise auto-detects latest stable from php.net (skips **X.Y.0** by default).
+* **Repo setup**: Adds Ondřej PPA (Ubuntu) or Sury (Debian); enables Remi or AL2023 module streams on DNF-based systems.
+* **Extensions**: Installs a practical set (`curl mbstring intl xml zip gd mysql ldap opcache bcmath readline`).
+* **Web integration**: Optionally switches **libapache2-mod-php** on Debian/Ubuntu or enables **php-fpm** with Apache.
+* **Safety & logging**: Strict mode (`set -euo pipefail`), clear logs, distro detection, and graceful fallbacks.
+
+## Requirements
+
+* Run as **root**.
+* Internet access to package repos and php.net JSON.
+* Package managers: **apt** or **dnf** available.
+
+## Usage
+
+```bash
+# Auto-detect latest stable (skips .0 minors)
+sudo ./update-php.sh
+
+# Pin a branch or exact patch
+sudo ./update-php.sh --version 8.3
+sudo ./update-php.sh --version 8.3.12
+
+# Allow .0 minors
+sudo ./update-php.sh --allow-dot-zero
+
+# Choose integration mode
+sudo ./update-php.sh --fpm
+sudo ./update-php.sh --mod-php                 # Debian/Ubuntu only
+
+# Specify Apache service name when needed
+sudo ./update-php.sh --apache-service httpd    # RHEL/Alma/Rocky/AMZ
+```
+
+## What It Does (Flow)
+
+1. Detect OS and package manager; set appropriate Apache service.
+2. Determine target PHP version (CLI `--version` or fetch from php.net).
+3. Configure package repositories (Ondřej/Sury on apt; Remi/AL modules on dnf).
+4. Install PHP for the requested **series** and the listed **extensions**.
+5. If requested, switch **mod\_php** (a2dismod/a2enmod) or enable **php-fpm** and restart Apache.
+6. Print summary (`php -v`) and ensure services are enabled/restarted.
+
+## Notes
+
+* By default, **`SKIP_DOT_ZERO=1`** avoids `.0` minor releases (can be overridden with `--allow-dot-zero`).
+* On Amazon Linux 2023, you must provide `--version` to pick the stream (e.g., `8.3`).
+* For RHEL-family, Apache integration is via **php-fpm + proxy\_fcgi** (mod\_php is uncommon).
+
+
+# `cert.sh` — Short Read Me
+
+## Purpose
+
+Automate **Let’s Encrypt** certificate issuance and renewal for Apache (webroot `http-01`) non-interactively. Detects and fixes snakeoil/staging/mis-chained certs, discovers vhosts, validates webroots, and patches Apache configs to use the issued LE certs.
+
+## Key Capabilities
+
+* **Vhost discovery & parsing**: Reads Apache configs (`apache2ctl/httpd`) to find `ServerName`/`ServerAlias`, :80/:443 blocks, and document roots.
+* **Webroot preflight**: Writes a temporary token under `.well-known/acme-challenge/` and verifies it via HTTP before requesting a cert.
+* **Issuance/Renewal logic**: Renews when `< RENEW_DAYS` remain, when SANs change, or when served issuer is not production Let’s Encrypt.
+* **Auto-patching**: Inserts or normalizes :443 blocks, replaces `SSLCertificateFile`/`KeyFile` with LE paths, removes deprecated `ChainFile`, and can disable `default-ssl` snakeoil.
+* **Operational checks**: Verifies local 443 listener, external reachability, Cloudflare proxy presence (with optional wait), IPv6 hints.
+* **Safety**: Single-instance lock; configtest + reloads (and restart fallback) after changes.
+
+## Defaults (tunable in script)
+
+* `CERT_EMAIL="info@tocsindata.com"`
+* `RENEW_DAYS=30`
+* `STAGING=0` (production ACME by default)
+* `APACHE_RELOAD_CMD="systemctl reload apache2"`
+* `FORCE_DISABLE_DEFAULT_SSL=1`
+* `PREF_CHALLENGE="http-01"`
+
+## Requirements
+
+* Run as **root**.
+* Packages: `certbot`, `apache2ctl` or `httpd`, `openssl`, `curl` (and `nc` for reachability checks recommended).
+* Apache vhosts present and resolvable via DNS; port **80** reachable for `http-01`.
+
+## How It Works (Flow)
+
+1. Sanity checks (443 listener, external reachability, tools present).
+2. Collect and parse vhost configs → build domain groups (primary + aliases) and webroots.
+3. **Preflight** each domain’s webroot via HTTP token fetch.
+4. Run `certbot certonly` (production unless `STAGING=1`) with per-domain `-w` roots.
+5. Patch vhosts to LE `fullchain.pem`/`privkey.pem`, reload Apache, verify served fingerprint.
+6. Handle Cloudflare (optional wait/probe). Summarize outcome.
+
+## Usage
+
+```bash
+sudo ./cert.sh
+# Non-interactive; discovers all Apache vhosts and (re)issues as needed.
+```
+
+## Notes
+
+* If behind **Cloudflare**, temporarily gray-cloud DNS or switch to DNS-01; the script warns and performs a post-issue probe with a short wait.
+* The script does not manage cron; schedule it yourself (e.g., daily) to keep certificates current.

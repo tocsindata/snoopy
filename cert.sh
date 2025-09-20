@@ -1,7 +1,5 @@
-#!/usr/bin/env bash
-# project: ERGSS DevOps (https://github.com/tocsindata/ergss_project2025)
-# framework: independent ops script
-# file: /usr/local/sbin/cert.sh
+#!/usr/bin/env bash 
+# file: cert.sh
 # date: 2025-09-19
 # copyright: Daniel Foscarini (www.tocsindata.com) info@tocsindata.com
 

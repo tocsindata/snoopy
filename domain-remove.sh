@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
+# file: domain-remove.sh
 # Reverse of setup.sh: remove a domain's vhost and (optionally) the related system user & home.
 # Assumes Debian/Ubuntu Apache layout (apache2ctl, a2ensite/a2dissite).
 # DocumentRoot (from setup): /home/<sanitized-username>/public_html
+
+set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
   echo "This script must be run as root" >&2

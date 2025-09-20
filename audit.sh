@@ -1,7 +1,5 @@
-#!/usr/bin/env bash 
-# project: USERSPICE-5-ENV-AUDIT (https://github.com/tocsindata/userspice-5-env-audit)
-# framework: Server readiness auditor for UserSpice 5 (audit-only; no mutations)
-# file: scripts/userspice5-audit.sh
+#!/usr/bin/env bash  
+# file: audit.sh
 # date: 2025-09-17
 
 set -euo pipefail

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash 
-set -euo pipefail
-
+# file: add-domain.sh
 # This script sets up an Apache vhost for a single domain and a matching (sanitized) system user.
 # DocumentRoot: /home/<sanitized-username>/public_html
 #
 # Username policy:
 # - Domain is lowercased, dots and any non [a-z0-9_-] are replaced with underscores.
 # - Many distros/tools reject '.' in usernames; sanitizing is safer and portable.
+
+set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
   echo "This script must be run as root" >&2

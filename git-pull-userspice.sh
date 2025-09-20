@@ -1,5 +1,5 @@
 #!/usr/bin/env bash 
-# file: /root/git-clone-userspice.sh
+# file: git-pull-userspice.sh
 # purpose: Clone tocsindata/UserSpice5 into /home/<USER>/public_html and apply canonical UserSpice perms
 # behavior:
 #   - prompt for target account under /home

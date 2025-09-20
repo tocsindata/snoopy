@@ -1,3 +1,0 @@
-# name | repo_url | ref | src_path | dest_path | owner | group | mode | post_cmd | repo_public | repo_token
-prod-index | https://github.com/org/private-repo.git | main | public_html/index.php | /home/USER/public/index.php | www-data | www-data | 0644 | systemctl reload apache2 | false | <READ_ONLY_TOKEN>
-favicon    | https://github.com/org/public-assets.git | v1.2.3 | assets/favicon.ico    | /home/USER/public/favicon.ico | www-data | www-data | 0644 | NULL | true | NULL
